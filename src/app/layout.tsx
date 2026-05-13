@@ -7,11 +7,7 @@ export const metadata: Metadata = {
   description: '블로그 글을 책으로 엮어주는 서비스',
 };
 
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="ko">
       <body className="bg-gray-50 text-gray-900 antialiased">
