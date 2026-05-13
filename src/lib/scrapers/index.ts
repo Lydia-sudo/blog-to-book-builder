@@ -4,10 +4,12 @@ import { ScrapeResult } from '@/types';
 
 const rssParser = new Parser();
 
-function detectBlogType(url: string): 'naver' | 'tistory' | 'wordpress' | 'rss' | 'unknown' {
+export type BlogPlatform = 'naver' | 'tistory' | 'wordpress' | 'rss' | 'unknown';
+
+export function detectBlogType(url: string): BlogPlatform {
   if (url.includes('blog.naver.com')) return 'naver';
   if (url.includes('.tistory.com')) return 'tistory';
-  if (url.includes('wordpress.com') || url.includes('/feed') || url.endsWith('.xml')) return 'rss';
+  if (url.includes('/feed') || url.endsWith('.xml') || url.includes('/rss')) return 'rss';
   return 'unknown';
 }
 
@@ -20,16 +22,181 @@ async function fetchHtml(url: string): Promise<string> {
       'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
     },
   });
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-  }
-
+  if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
   return response.text();
 }
 
+// ─── URL collection (phase 1) ────────────────────────────────────────────────
+
+async function collectNaverPostUrls(rootUrl: string, maxPosts: number): Promise<string[]> {
+  const match = rootUrl.match(/blog\.naver\.com\/([^/?#]+)/);
+  if (!match) return [];
+  const blogId = match[1];
+
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  let page = 1;
+
+  while (urls.length < maxPosts) {
+    const listUrl = `https://blog.naver.com/PostList.naver?blogId=${blogId}&currentPage=${page}`;
+    try {
+      const html = await fetchHtml(listUrl);
+      const $ = cheerio.load(html);
+      let found = 0;
+
+      $('a[href]').each((_, el) => {
+        const href = $(el).attr('href') || '';
+        const logNoMatch = href.match(/[?&]logNo=(\d+)/);
+        if (logNoMatch) {
+          const postUrl = `https://blog.naver.com/${blogId}/${logNoMatch[1]}`;
+          if (!seen.has(postUrl)) {
+            seen.add(postUrl);
+            urls.push(postUrl);
+            found++;
+          }
+        }
+      });
+
+      if (found === 0) break;
+      page++;
+    } catch {
+      break;
+    }
+  }
+
+  return urls.slice(0, maxPosts);
+}
+
+async function collectTistoryPostUrls(rootUrl: string, maxPosts: number): Promise<string[]> {
+  const base = new URL(rootUrl).origin;
+  const seen = new Set<string>();
+
+  // Try sitemap.xml first
+  try {
+    const sitemapXml = await fetchHtml(`${base}/sitemap.xml`);
+    const $ = cheerio.load(sitemapXml, { xmlMode: true });
+    const locs: string[] = [];
+    $('loc').each((_, el) => {
+      const loc = $(el).text().trim();
+      if (loc.startsWith(base) && loc !== base && loc !== `${base}/`) {
+        locs.push(loc);
+      }
+    });
+    if (locs.length > 0) return locs.slice(0, maxPosts);
+  } catch {
+    // fall through to pagination
+  }
+
+  // Pagination fallback
+  const urls: string[] = [];
+  let page = 1;
+
+  while (urls.length < maxPosts) {
+    try {
+      const html = await fetchHtml(`${base}/?page=${page}`);
+      const $ = cheerio.load(html);
+      let found = 0;
+
+      $('a[href]').each((_, el) => {
+        const href = $(el).attr('href') || '';
+        const fullUrl = href.startsWith('http') ? href : `${base}${href}`;
+        if (
+          fullUrl.startsWith(base) &&
+          fullUrl !== base &&
+          (fullUrl.match(/\/\d+$/) || fullUrl.includes('/entry/')) &&
+          !seen.has(fullUrl)
+        ) {
+          seen.add(fullUrl);
+          urls.push(fullUrl);
+          found++;
+        }
+      });
+
+      if (found === 0) break;
+      page++;
+    } catch {
+      break;
+    }
+  }
+
+  return urls.slice(0, maxPosts);
+}
+
+async function collectWordpressPostUrls(rootUrl: string, maxPosts: number): Promise<string[]> {
+  const base = new URL(rootUrl).origin;
+  const urls: string[] = [];
+  let page = 1;
+
+  while (urls.length < maxPosts) {
+    try {
+      const apiUrl = `${base}/wp-json/wp/v2/posts?per_page=100&page=${page}&_fields=link`;
+      const res = await fetch(apiUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+      });
+      if (!res.ok) break;
+      const posts: Array<{ link: string }> = await res.json();
+      if (!Array.isArray(posts) || posts.length === 0) break;
+
+      for (const post of posts) {
+        if (post.link) urls.push(post.link);
+      }
+      if (posts.length < 100) break;
+      page++;
+    } catch {
+      break;
+    }
+  }
+
+  return urls.slice(0, maxPosts);
+}
+
+async function collectRssPostUrls(feedUrl: string, maxPosts: number): Promise<string[]> {
+  const feed = await rssParser.parseURL(feedUrl);
+  return feed.items
+    .map((item) => item.link || '')
+    .filter(Boolean)
+    .slice(0, maxPosts);
+}
+
+export async function collectPostUrls(
+  rootUrl: string,
+  maxPosts: number
+): Promise<{ urls: string[]; platform: BlogPlatform }> {
+  const platform = detectBlogType(rootUrl);
+
+  let urls: string[];
+  switch (platform) {
+    case 'naver':
+      urls = await collectNaverPostUrls(rootUrl, maxPosts);
+      break;
+    case 'tistory':
+      urls = await collectTistoryPostUrls(rootUrl, maxPosts);
+      break;
+    case 'rss':
+      urls = await collectRssPostUrls(rootUrl, maxPosts);
+      break;
+    default: {
+      // WordPress REST API detection
+      const base = (() => { try { return new URL(rootUrl).origin; } catch { return null; } })();
+      if (base) {
+        const wpUrls = await collectWordpressPostUrls(rootUrl, maxPosts);
+        if (wpUrls.length > 0) return { urls: wpUrls, platform: 'wordpress' };
+      }
+      // Last resort: treat as RSS
+      try {
+        urls = await collectRssPostUrls(rootUrl, maxPosts);
+      } catch {
+        urls = [rootUrl];
+      }
+    }
+  }
+
+  return { urls, platform };
+}
+
+// ─── Individual post scrapers (phase 2) ──────────────────────────────────────
+
 export async function scrapeNaver(url: string): Promise<ScrapeResult> {
-  // 네이버 블로그는 iframe으로 본문을 로드하므로 모바일 URL 사용
   const mobileUrl = url.replace('blog.naver.com', 'm.blog.naver.com');
   const html = await fetchHtml(mobileUrl);
   const $ = cheerio.load(html);
@@ -95,9 +262,7 @@ export async function scrapeTistory(url: string): Promise<ScrapeResult> {
   const images: string[] = [];
   $('img').each((_, el) => {
     const src = $(el).attr('src') || $(el).attr('data-original');
-    if (src && src.startsWith('http')) {
-      images.push(src);
-    }
+    if (src && src.startsWith('http')) images.push(src);
   });
 
   const tags: string[] = [];
@@ -134,9 +299,7 @@ export async function scrapeWordpress(url: string): Promise<ScrapeResult> {
   const images: string[] = [];
   $('img').each((_, el) => {
     const src = $(el).attr('src');
-    if (src && src.startsWith('http')) {
-      images.push(src);
-    }
+    if (src && src.startsWith('http')) images.push(src);
   });
 
   const tags: string[] = [];
@@ -150,17 +313,13 @@ export async function scrapeWordpress(url: string): Promise<ScrapeResult> {
 
 export async function scrapeRss(feedUrl: string): Promise<ScrapeResult[]> {
   const feed = await rssParser.parseURL(feedUrl);
-
   return feed.items.map((item) => {
     const $ = cheerio.load(item.content || item['content:encoded'] || '');
     const images: string[] = [];
     $('img').each((_, el) => {
       const src = $(el).attr('src');
-      if (src && src.startsWith('http')) {
-        images.push(src);
-      }
+      if (src && src.startsWith('http')) images.push(src);
     });
-
     return {
       title: item.title || '제목 없음',
       content: item.content || item['content:encoded'] || '',
@@ -175,7 +334,6 @@ export async function scrapeRss(feedUrl: string): Promise<ScrapeResult[]> {
 export async function scrapeGeneric(url: string): Promise<ScrapeResult> {
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
-
   $('script, style, nav, header, footer, aside, .ad, .advertisement').remove();
 
   const title =
@@ -199,18 +357,30 @@ export async function scrapeGeneric(url: string): Promise<ScrapeResult> {
   const images: string[] = [];
   $('img').each((_, el) => {
     const src = $(el).attr('src');
-    if (src && src.startsWith('http')) {
-      images.push(src);
-    }
+    if (src && src.startsWith('http')) images.push(src);
   });
 
   return { title, content, publishedAt, images: [...new Set(images)], tags: [], originalUrl: url };
 }
 
-export async function scrapeUrl(url: string): Promise<ScrapeResult | ScrapeResult[]> {
-  const type = detectBlogType(url);
+/** Scrape a single post URL (never calls RSS parser — individual HTML page only). */
+export async function scrapePostUrl(url: string): Promise<ScrapeResult> {
+  const platform = detectBlogType(url);
+  switch (platform) {
+    case 'naver':
+      return scrapeNaver(url);
+    case 'tistory':
+      return scrapeTistory(url);
+    default:
+      if (url.includes('wordpress') || url.includes('/wp-')) return scrapeWordpress(url);
+      return scrapeGeneric(url);
+  }
+}
 
-  switch (type) {
+/** Legacy entry point — kept for backwards compatibility. */
+export async function scrapeUrl(url: string): Promise<ScrapeResult | ScrapeResult[]> {
+  const platform = detectBlogType(url);
+  switch (platform) {
     case 'naver':
       return scrapeNaver(url);
     case 'tistory':
@@ -218,9 +388,7 @@ export async function scrapeUrl(url: string): Promise<ScrapeResult | ScrapeResul
     case 'rss':
       return scrapeRss(url);
     default:
-      if (url.includes('wordpress')) {
-        return scrapeWordpress(url);
-      }
+      if (url.includes('wordpress')) return scrapeWordpress(url);
       return scrapeGeneric(url);
   }
 }
