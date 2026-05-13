@@ -44,8 +44,14 @@ export default function LandingPage() {
           AI의 도움으로 서문과 에필로그를 작성해 PDF, DOCX, EPUB으로 내보내세요.
         </p>
 
-        <div className="flex justify-center">
+        <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
           <LoginButton />
+          <Link
+            href="/projects"
+            className="flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg shadow-md hover:bg-blue-700 transition-colors text-sm font-semibold"
+          >
+            무료로 시작하기 →
+          </Link>
         </div>
 
         {/* Features */}

@@ -17,7 +17,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    // Fallback: if Firebase doesn't respond within 3s (e.g. missing env vars), unblock the UI
+    const timeout = setTimeout(() => setLoading(false), 3000);
+
     const unsubscribe = onAuthStateChanged(auth, (firebaseUser: FirebaseUser | null) => {
+      clearTimeout(timeout);
       if (firebaseUser) {
         setUser({
           uid: firebaseUser.uid,
@@ -31,7 +35,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setLoading(false);
     });
 
-    return unsubscribe;
+    return () => {
+      clearTimeout(timeout);
+      unsubscribe();
+    };
   }, []);
 
   return <AuthContext.Provider value={{ user, loading }}>{children}</AuthContext.Provider>;
